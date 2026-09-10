@@ -3,6 +3,7 @@
 #define HAX_MODEL_META_H
 
 #include "effort.h"
+#include "transport/http.h"
 
 struct catalog_entry;
 struct model_info;
@@ -22,8 +23,19 @@ void model_meta_release(struct provider *provider);
  * for the same model is retained. NULL-safe. */
 void model_meta_refresh(struct provider *provider, const char *model);
 
+/* Start the background catalog refresh, if one is due, for a provider with a catalog identity.
+ * This is the only trigger for catalog network traffic: a provider without an identity never
+ * causes a fetch. NULL-safe. */
+void model_meta_prefetch(const struct provider *provider);
+
+/* model_meta_prefetch, then wait up to `timeout_ms` measured from the refresh's start for it to
+ * land, leaving a slower fetch running in the background. A non-NULL `tick` returning non-zero
+ * abandons the wait early. Probes are untouched. NULL-safe. */
+void model_meta_wait_catalog(const struct provider *provider, long timeout_ms, http_tick_cb tick,
+                             void *tick_user);
+
 /* Wait for the metadata sources to settle: an active probe, without cancelling it, and, bounded
- * by MODEL_META_WAIT_MS, a running catalog refresh when the provider has a catalog identity.
+ * by MODEL_META_WAIT_MS, the catalog refresh, started here if due (model_meta_wait_catalog).
  * NULL-safe. */
 void model_meta_wait(struct provider *provider);
 

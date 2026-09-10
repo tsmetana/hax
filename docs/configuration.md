@@ -266,9 +266,12 @@ rarely report a light background reliably, so set `light` explicitly if auto det
 | `catalog.refresh` | `HAX_CATALOG_REFRESH` | `24h` | Refresh age; `0` disables fetching. |
 
 hax uses model metadata for context limits, image capability, and estimated spend. It caches
-[models.dev](https://models.dev/api.json) data and refreshes it in the background only when needed.
-A stale cache remains usable. Set `catalog.url` empty or `catalog.refresh` to `0` to prevent network
-refreshes; an existing cache may still be read.
+[models.dev](https://models.dev/api.json) data and refreshes it in the background only when needed:
+a refresh starts only when a provider with a catalog identity is about to use the data (its first
+request, or a `/model` or `/effort` picker), and only when the cache is older than
+`catalog.refresh`. Local providers and custom providers without a `catalog_id` never cause a
+fetch. A stale cache remains usable. Set `catalog.url` empty or `catalog.refresh` to `0` to prevent
+network refreshes; an existing cache may still be read.
 
 Per-model overrides can be placed under `catalog.models`, with costs in USD per million tokens:
 

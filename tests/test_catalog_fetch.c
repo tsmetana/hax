@@ -17,6 +17,8 @@
 
 #include "catalog.h"
 #include "harness.h"
+#include "model_meta.h"
+#include "provider.h"
 
 /* Parent-made temp root; children carve their own XDG_CACHE_HOME under it. */
 static char *g_root;
@@ -99,6 +101,15 @@ static void write_snapshot(const char *json)
     fclose(f);
 }
 
+static void backdate_snapshot_days(long days)
+{
+    char path[600];
+    snprintf(path, sizeof(path), "%s/hax/catalog.json", getenv("XDG_CACHE_HOME"));
+    struct timeval tv[2] = {{time(NULL) - days * 24 * 60 * 60, 0},
+                            {time(NULL) - days * 24 * 60 * 60, 0}};
+    EXPECT(utimes(path, tv) == 0);
+}
+
 /* Poll the asynchronous refresh for at most three seconds. */
 static int wait_for_rate(const char *provider_id, const char *model, double expected_rate)
 {
@@ -126,7 +137,8 @@ static void scenario_cold_start(void)
     pthread_t server_thread;
     EXPECT(pthread_create(&server_thread, NULL, serve_once, &server) == 0);
 
-    EXPECT(catalog_prefetch() == 0); /* no snapshot yet ⇒ nothing to be stale */
+    catalog_prefetch();
+    EXPECT(catalog_stale_days() == 0); /* no snapshot yet ⇒ nothing to be stale */
     EXPECT(wait_for_rate("openai", "m1", 7));
 
     pthread_join(server_thread, NULL);
@@ -153,7 +165,8 @@ static void scenario_refresh_invalidates_memo(void)
 
     pthread_t server_thread;
     EXPECT(pthread_create(&server_thread, NULL, serve_once, &server) == 0);
-    EXPECT(catalog_prefetch() == 0); /* stale for the TTL, not for the alarm */
+    catalog_prefetch();
+    EXPECT(catalog_stale_days() == 0); /* stale for the TTL, not for the alarm */
     EXPECT(wait_for_rate("openai", "m2", 9));
 
     pthread_join(server_thread, NULL);
@@ -248,7 +261,7 @@ static void scenario_drain_completes_fetch(void)
     pthread_t server_thread;
     EXPECT(pthread_create(&server_thread, NULL, serve_once, &server) == 0);
 
-    EXPECT(catalog_prefetch() == 0);
+    catalog_prefetch();
     catalog_drain(5000);
     struct catalog_entry entry;
     EXPECT(catalog_lookup(NULL, "openai", "m5", &entry) == 0);
@@ -261,29 +274,130 @@ static void scenario_drain_completes_fetch(void)
 static void scenario_stale_snapshot_warns(void)
 {
     /* A snapshot that hasn't refreshed for over the alarm window (~30d)
-     * makes prefetch report its age — the caller's cue to warn that
-     * estimates may have drifted — while the refresh it spawns still
-     * recovers as usual. */
+     * makes prefetch record its age for catalog_stale_days — the frontend's
+     * cue to warn that estimates may have drifted — while the refresh it
+     * spawns still recovers as usual. */
     struct test_server server = {.body = "{\"openai\": {\"models\": {"
-                                         "\"m4\": {\"cost\": {\"input\": 9, \"output\": 1}}}}}"};
+                                         "\"m4\": {\"cost\": {\"input\": 9, \"output\": 1}}}}}",
+                                 .delay_ms =
+                                     300}; /* the age is read while the fetch is in flight */
     int port = server_listen(&server);
     EXPECT(port > 0);
     child_env("stale", port);
     write_snapshot("{\"openai\": {\"models\": {"
                    "\"m4\": {\"cost\": {\"input\": 2, \"output\": 1}}}}}");
-    /* Backdate the snapshot 40 days. */
-    char path[600];
-    snprintf(path, sizeof(path), "%s/hax/catalog.json", getenv("XDG_CACHE_HOME"));
-    struct timeval tv[2] = {{time(NULL) - 40L * 24 * 60 * 60, 0},
-                            {time(NULL) - 40L * 24 * 60 * 60, 0}};
-    EXPECT(utimes(path, tv) == 0);
+    backdate_snapshot_days(40);
 
     pthread_t server_thread;
     EXPECT(pthread_create(&server_thread, NULL, serve_once, &server) == 0);
-    long stale_days = catalog_prefetch();
+    catalog_prefetch();
+    long stale_days = catalog_stale_days();
     EXPECT(stale_days >= 39 && stale_days <= 41);
-    EXPECT(catalog_prefetch() == 0); /* one report (and one fetch) per run */
+    catalog_prefetch();                /* one fetch per run */
+    EXPECT(catalog_stale_days() == 0); /* and one report */
     EXPECT(wait_for_rate("openai", "m4", 9));
+
+    pthread_join(server_thread, NULL);
+    catalog_shutdown();
+}
+
+static void scenario_wait_catalog_starts_fetch(void)
+{
+    /* A picker or pre-request wait on a catalog-backed provider is itself the trigger: nothing
+     * has called catalog_prefetch before it, and the fetched values are visible when it returns,
+     * without polling. */
+    struct test_server server = {.body = "{\"openai\": {\"models\": {"
+                                         "\"m6\": {\"cost\": {\"input\": 7, \"output\": 1}}}}}"};
+    int port = server_listen(&server);
+    EXPECT(port > 0);
+    child_env("wait-starts", port);
+    pthread_t server_thread;
+    EXPECT(pthread_create(&server_thread, NULL, serve_once, &server) == 0);
+
+    struct provider provider = {.catalog_id = "openai"};
+    model_meta_wait_catalog(&provider, 5000, NULL, NULL);
+    struct catalog_entry entry;
+    EXPECT(catalog_lookup(NULL, "openai", "m6", &entry) == 0);
+    EXPECT(entry.cost_input == 7);
+
+    pthread_join(server_thread, NULL);
+    catalog_shutdown();
+}
+
+static void scenario_no_identity_never_fetches(void)
+{
+    /* A provider without a catalog identity (a local server) must not cause any request to the
+     * catalog host, however the metadata path is exercised. */
+    struct test_server server = {.body = "{}"};
+    int port = server_listen(&server);
+    EXPECT(port > 0);
+    child_env("no-identity", port);
+
+    struct provider local = {.catalog_id = NULL};
+    model_meta_prefetch(&local);
+    model_meta_wait_catalog(&local, 5000, NULL, NULL);
+    model_meta_wait_ms(&local, 5000);
+    /* No connection may arrive on the listener within a generous grace period. */
+    struct pollfd poll_fd = {.fd = server.listen_fd, .events = POLLIN};
+    EXPECT(poll(&poll_fd, 1, 300) == 0);
+    close(server.listen_fd);
+    catalog_shutdown();
+}
+
+static int always_cancel(void *user)
+{
+    (void)user;
+    return 1;
+}
+
+static void scenario_wait_honors_cancellation(void)
+{
+    /* A picker's Esc must dismiss the wait at once while the fetch keeps running to completion,
+     * so the cache still warms for later callers. */
+    struct test_server server = {.body = "{\"openai\": {\"models\": {"
+                                         "\"m7\": {\"cost\": {\"input\": 7, \"output\": 1}}}}}",
+                                 .delay_ms = 1500};
+    int port = server_listen(&server);
+    EXPECT(port > 0);
+    child_env("wait-cancel", port);
+    pthread_t server_thread;
+    EXPECT(pthread_create(&server_thread, NULL, serve_once, &server) == 0);
+
+    struct timespec before, after;
+    clock_gettime(CLOCK_MONOTONIC, &before);
+    catalog_prefetch();
+    catalog_wait(5000, always_cancel, NULL);
+    clock_gettime(CLOCK_MONOTONIC, &after);
+    long elapsed_ms =
+        (after.tv_sec - before.tv_sec) * 1000 + (after.tv_nsec - before.tv_nsec) / 1000000;
+    EXPECT(elapsed_ms < 1000);
+    EXPECT(wait_for_rate("openai", "m7", 7)); /* the fetch itself was not cancelled */
+
+    pthread_join(server_thread, NULL);
+    catalog_shutdown();
+}
+
+static void scenario_refresh_clears_stale_warning(void)
+{
+    /* When the refresh lands before the frontend reads the age — a picker waited for it — the
+     * stale snapshot is gone and warning about it would be false. */
+    struct test_server server = {.body = "{\"openai\": {\"models\": {"
+                                         "\"m8\": {\"cost\": {\"input\": 9, \"output\": 1}}}}}"};
+    int port = server_listen(&server);
+    EXPECT(port > 0);
+    child_env("stale-refreshed", port);
+    write_snapshot("{\"openai\": {\"models\": {"
+                   "\"m8\": {\"cost\": {\"input\": 2, \"output\": 1}}}}}");
+    backdate_snapshot_days(40);
+
+    pthread_t server_thread;
+    EXPECT(pthread_create(&server_thread, NULL, serve_once, &server) == 0);
+    catalog_prefetch();
+    catalog_wait(5000, NULL, NULL);
+    struct catalog_entry entry;
+    EXPECT(catalog_lookup(NULL, "openai", "m8", &entry) == 0);
+    EXPECT(entry.cost_input == 9);
+    EXPECT(catalog_stale_days() == 0);
 
     pthread_join(server_thread, NULL);
     catalog_shutdown();
@@ -323,6 +437,10 @@ int main(void)
     run_scenario("trailing-garbage-keeps-snapshot", scenario_trailing_garbage_keeps_snapshot);
     run_scenario("drain-completes-fetch", scenario_drain_completes_fetch);
     run_scenario("stale-snapshot-warns", scenario_stale_snapshot_warns);
+    run_scenario("wait-catalog-starts-fetch", scenario_wait_catalog_starts_fetch);
+    run_scenario("no-identity-never-fetches", scenario_no_identity_never_fetches);
+    run_scenario("wait-honors-cancellation", scenario_wait_honors_cancellation);
+    run_scenario("refresh-clears-stale-warning", scenario_refresh_clears_stale_warning);
 
     T_REPORT();
 }

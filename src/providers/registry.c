@@ -206,9 +206,8 @@ static const struct provider_def *const *config_defs(size_t *out_count)
             } else if (!shipped_find(names[i])) {
                 struct provider_def *def = xcalloc(1, sizeof(*def));
                 def->id = xstrdup(names[i]); /* process-lifetime; the registry never frees it */
-                /* A shipped def curates its catalog identity or absence; a config-only def
-                 * defaults to its own name. */
-                def->catalog_id = def->id;
+                /* No catalog identity until providers.<name>.catalog_id names one: a local
+                 * server or proxy must not reach models.dev or inherit a namesake's prices. */
                 defs[count++] = def;
             }
             free(names[i]);

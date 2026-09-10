@@ -563,8 +563,10 @@ static void test_prefetch_disabled_is_noop(void)
 {
     /* Opting out of refreshes also opts out of stale-snapshot warnings. */
     setenv("HAX_CATALOG_URL", "", 1);
-    EXPECT(catalog_prefetch() == 0);
-    EXPECT(catalog_prefetch() == 0); /* once-latched, still safe */
+    catalog_prefetch();
+    EXPECT(catalog_stale_days() == 0);
+    catalog_prefetch(); /* once-latched, still safe */
+    EXPECT(catalog_stale_days() == 0);
     catalog_shutdown();
     unsetenv("HAX_CATALOG_URL");
 }

@@ -207,22 +207,32 @@ void model_meta_refresh(struct provider *provider, const char *model)
         probe_task_free(task);
 }
 
-/* The snapshot is keyed by catalog_id; without one, only configuration and the probe apply. */
-static void wait_catalog(const struct provider *provider, long timeout_ms)
+/* The snapshot is keyed by catalog_id; without one, only configuration and the probe apply, and
+ * no fetch may be started on the provider's behalf. */
+void model_meta_prefetch(const struct provider *provider)
 {
     if (provider && provider->catalog_id)
-        catalog_wait(timeout_ms);
+        catalog_prefetch();
+}
+
+void model_meta_wait_catalog(const struct provider *provider, long timeout_ms, http_tick_cb tick,
+                             void *tick_user)
+{
+    if (!provider || !provider->catalog_id)
+        return;
+    catalog_prefetch();
+    catalog_wait(timeout_ms, tick, tick_user);
 }
 
 void model_meta_wait(struct provider *provider)
 {
-    wait_catalog(provider, MODEL_META_WAIT_MS);
+    model_meta_wait_catalog(provider, MODEL_META_WAIT_MS, NULL, NULL);
     join_probe(provider);
 }
 
 void model_meta_wait_ms(struct provider *provider, long timeout_ms)
 {
-    wait_catalog(provider, timeout_ms);
+    model_meta_wait_catalog(provider, timeout_ms, NULL, NULL);
     if (!provider || !provider->meta || !provider->meta->probe_job)
         return;
     /* The budget is anchored at probe start so stacked callers on one request path do not each

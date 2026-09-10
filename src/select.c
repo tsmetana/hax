@@ -350,11 +350,15 @@ static struct model_pick_result choose_model(struct agent_state *state, struct p
         disp_sync_external_line(&state->render->disp);
         return result;
     }
+    /* The picker's metadata columns come from the catalog; refresh it alongside enumeration. */
+    model_meta_prefetch(provider);
     /* Model enumeration can block, so expose progress and cancellation before the picker opens. */
     struct busy *busy = busy_begin("fetching models...");
     char *error = NULL;
     int list_result =
         provider->list_models(provider, &models, &model_count, &error, busy_tick, NULL);
+    if (list_result == 0)
+        model_meta_wait_catalog(provider, MODEL_META_WAIT_MS, busy_tick, NULL);
     if (busy_end(busy)) {
         /* Discard a result that races cancellation; busy_end already rendered interruption. */
         model_info_free(models, model_count);
@@ -403,6 +407,15 @@ static struct value_pick_result choose_effort(struct agent_state *state, struct 
                                               int announce_unavailable)
 {
     struct value_pick_result result = {.status = PICK_NONE};
+    /* The ladder may come from the catalog; a cold cache would otherwise offer the provider's
+     * unverified levels. Usually a no-op after a model pick. */
+    struct busy *busy = busy_begin("fetching model catalog...");
+    model_meta_wait_catalog(provider, MODEL_META_WAIT_MS, busy_tick, NULL);
+    if (busy_end(busy)) {
+        disp_sync_external_line(&state->render->disp);
+        result.status = PICK_CANCELLED;
+        return result;
+    }
     struct effort_set levels;
     model_meta_efforts(provider, model, &levels);
     if (levels.count == 0) {

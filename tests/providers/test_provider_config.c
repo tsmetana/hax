@@ -416,8 +416,8 @@ int main(void)
         EXPECT_STR_EQ(myllm->name, "My LLM");
         EXPECT(myllm->list_efforts && myllm->list_efforts(myllm, &efforts) > 0);
         EXPECT(myllm->keep_model_order == 0); /* sort_models unset → sorted picker */
-        /* catalog_id defaults to the provider's own name. */
-        EXPECT_STR_EQ(myllm->catalog_id, "myllm");
+        /* No catalog identity unless configured: a custom block never reaches models.dev. */
+        EXPECT(myllm->catalog_id == NULL);
         myllm->destroy(myllm);
     }
 

@@ -1402,16 +1402,16 @@ int agent_run(struct provider **provider_io, const struct hax_opts *options)
         /* Persist the prompt before entering a provider call that may hang or be interrupted. */
         agent_flush_logs(transcript, state.session_log, session.items, session.n_items);
 
-        /* Start the one-per-run catalog refresh while the model generates; warn only when stale
-         * data may distort estimates. */
-        if (current_provider->catalog_id) {
-            long stale_days = catalog_prefetch();
-            if (stale_days > 0) {
-                disp_block_separator(&render.disp);
-                ui_note("model catalog last refreshed %ld days ago — cost estimates may be stale",
-                        stale_days);
-                disp_sync_external_line(&render.disp);
-            }
+        /* The effort resync above normally started the catalog refresh; this covers a provider
+         * whose metadata path did not need it, and warns once about stale data at the first
+         * request whose estimates it may distort. */
+        model_meta_prefetch(current_provider);
+        long stale_days = catalog_stale_days();
+        if (stale_days > 0) {
+            disp_block_separator(&render.disp);
+            ui_note("model catalog last refreshed %ld days ago — cost estimates may be stale",
+                    stale_days);
+            disp_sync_external_line(&render.disp);
         }
 
         /* Each request subsumes the prior prefix, so the latest reported usage is the current

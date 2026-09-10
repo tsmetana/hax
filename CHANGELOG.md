@@ -9,6 +9,12 @@ notes (see [docs/releasing.md](docs/releasing.md)).
 
 ### Changed
 
+- Custom providers no longer take their models.dev catalog identity from their own name; set
+  `catalog_id` explicitly (for example `"catalog_id": "groq"`) to keep pricing and context
+  metadata. Local servers and proxies without one never contact models.dev. See
+  [docs/providers.md](docs/providers.md#custom-providers).
+- `/model` and `/effort` wait briefly for the model catalog refresh, so pricing and context
+  columns appear even on a cold cache.
 - The collapsed preview for read-only bash commands now tolerates `echo`, `printf`, `true`, and
   `false` between exploration commands, such as the `echo ---` separators some models place
   between searches, and covers read-only git subcommands like `log`, `show`, `diff`, `status`,

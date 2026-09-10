@@ -286,7 +286,8 @@ Add any static OpenAI Chat Completions, OpenAI Responses, or Anthropic Messages 
   "providers": {
     "groq": {
       "base_url": "https://api.groq.com/openai/v1",
-      "api_key_env": "GROQ_API_KEY"
+      "api_key_env": "GROQ_API_KEY",
+      "catalog_id": "groq"
     },
     "company-proxy": {
       "display_name": "Company proxy",
@@ -310,14 +311,16 @@ Common fields:
 | `api_key_env` | Name of the environment variable holding the key; recommended. |
 | `api_key` | Literal key, or `$VAR` to read an environment variable. |
 | `sort_models` | Sort this provider's model picker newest-first (default); `off` keeps server order. |
-| `catalog_id` | Provider id in models.dev for cost/context metadata; empty disables lookup. |
+| `catalog_id` | Provider id in models.dev for cost/context metadata; unset means none. |
 | `metadata_api` | `/models` dialect: `openai` (flat list) or `anthropic` (paginated); defaults to the request protocol's family. |
 | `extra_body` | Raw JSON members merged into every request body ([below](#request-passthrough)). |
 | `extra_headers` | HTTP headers sent on every request ([below](#request-passthrough)). |
 
-A custom provider named after its models.dev id (for example `groq`) uses that identity by default.
-Use `catalog_id` when a proxy name differs from the underlying provider. Do not map local models to a
-hosted provider merely because names look similar: prices and context limits may differ.
+A custom provider has no catalog identity until `catalog_id` names one, so a block for a local
+server or a private proxy never contacts models.dev. Set it to the models.dev provider id (for
+example `groq`) to get pricing and context metadata for a hosted provider, or to the underlying
+provider's id for a proxy in front of one. Do not map local models to a hosted provider merely
+because names look similar: prices and context limits may differ.
 
 `api: "catalog"` declares a mixed-protocol gateway the model catalog already describes: each model
 routes by the catalog's per-model API — how the shipped OpenCode providers work — and models the

@@ -494,12 +494,12 @@ static int start_run(struct oneshot_state *state, const char *prompt,
     }
 
     state->started_ms = monotonic_ms();
-    if (provider->catalog_id) {
-        long stale_days = catalog_prefetch();
-        if (stale_days > 0)
-            hax_warn("model catalog last refreshed %ld days ago — cost estimates may be stale",
-                     stale_days);
-    }
+    /* The startup metadata wait normally started the catalog refresh already. */
+    model_meta_prefetch(provider);
+    long stale_days = catalog_stale_days();
+    if (stale_days > 0)
+        hax_warn("model catalog last refreshed %ld days ago — cost estimates may be stale",
+                 stale_days);
     return 0;
 }
 

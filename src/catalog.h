@@ -5,6 +5,7 @@
 #include <jansson.h>
 
 #include "effort.h"
+#include "transport/http.h"
 
 /* The model catalog resolves per-model pricing, token limits, image support, and reasoning-effort
  * metadata. User `catalog.models` configuration takes precedence over a cached models.dev
@@ -123,14 +124,20 @@ double catalog_price(const struct catalog_entry *entry, long input_tokens, long 
 
 /* Start the process-wide background refresh when the snapshot is older than catalog.refresh.
  * Empty catalog.url or a non-positive refresh interval disables fetching. Only the first call per
- * process does work. Returns the stale snapshot's age in days once it exceeds the warning
- * threshold, otherwise 0. Fetch failures leave the existing snapshot untouched. */
-long catalog_prefetch(void);
+ * process does work. Fetch failures leave the existing snapshot untouched. */
+void catalog_prefetch(void);
+
+/* Report the age in days of the snapshot catalog_prefetch found beyond the staleness warning
+ * threshold. Returns it once and 0 thereafter, so the warning reaches the user a single time
+ * wherever the refresh was started; 0 also when the snapshot was fresh, fetching is disabled, or
+ * the refresh has since replaced the stale snapshot. */
+long catalog_stale_days(void);
 
 /* Wait for a background refresh to land, up to `max_wait_ms` measured from its start so stacked
- * callers share the budget, leaving a slower fetch running for later callers. No-op when no
- * refresh is running. */
-void catalog_wait(long max_wait_ms);
+ * callers share the budget, leaving a slower fetch running for later callers. A non-NULL `tick`
+ * is polled throughout; a non-zero return abandons the wait early, again leaving the fetch
+ * running. No-op when no refresh is running. */
+void catalog_wait(long max_wait_ms, http_tick_cb tick, void *tick_user);
 
 /* Give short-lived runs up to `max_wait_ms` to finish a background refresh, then cancel and join
  * it. No-op when no refresh is running. */

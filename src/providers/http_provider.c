@@ -922,7 +922,7 @@ struct provider *http_provider_new(const struct provider_def *def)
      * silently send every model to the default wire. */
     if (provider->catalog_wires && !provider->catalog_id && provider->n_wire_rules == 0 &&
         !catalog_config_routes_models(name))
-        hax_warn("provider '%s': models route by catalog metadata, but catalog_id is empty",
+        hax_warn("provider '%s': models route by catalog metadata, but catalog_id is not set",
                  provider->name);
     /* Resolved regardless of the default wire: per-model rules can route to Messages. */
     const char *version = config_scoped_str(prefix, "version");

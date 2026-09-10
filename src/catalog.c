@@ -785,11 +785,17 @@ double catalog_price(const struct catalog_entry *entry, long input_tokens, long 
 
 /* ---------------- background fetch ---------------- */
 
-static struct bg_job *g_fetch_job;
-static long g_fetch_started_ms;
-static int g_prefetch_attempted;
-/* bg_job has no timed join, so catalog_drain polls this worker-owned flag. */
-static _Atomic int g_fetch_done;
+/* The process-wide refresh lifecycle. Foreground-owned, except `done`, which the worker sets:
+ * bg_job has no timed join, so the bounded waits poll it. */
+struct fetch_state {
+    int attempted; /* only the first catalog_prefetch call does work */
+    struct bg_job *job;
+    long started_ms;
+    _Atomic int done;
+    long stale_days_unreported;
+    int generation_at_start; /* a later cache generation means the stale snapshot is gone */
+};
+static struct fetch_state g_fetch;
 
 struct fetch_args {
     char *url;
@@ -820,82 +826,93 @@ static void fetch_worker(struct bg_job *job, void *arg)
         free(body);
     }
     fetch_args_free(args);
-    atomic_store(&g_fetch_done, 1);
+    atomic_store(&g_fetch.done, 1);
 }
 
-long catalog_prefetch(void)
+void catalog_prefetch(void)
 {
-    if (g_prefetch_attempted)
-        return 0;
-    g_prefetch_attempted = 1;
+    if (g_fetch.attempted)
+        return;
+    g_fetch.attempted = 1;
 
     const char *url = config_str("catalog.url");
     if (!url || !*url)
-        return 0;
+        return;
     long refresh_ms = config_duration_ms("catalog.refresh");
     if (refresh_ms <= 0)
-        return 0;
+        return;
     char *path = xdg_hax_cache_path(CATALOG_CACHE_FILE);
     if (!path)
-        return 0;
+        return;
 
-    long stale_days = 0;
     struct stat status;
     if (stat(path, &status) == 0) {
         long snapshot_age_s = (long)(time(NULL) - status.st_mtime);
         if (snapshot_age_s < refresh_ms / 1000) {
             free(path);
-            return 0;
+            return;
         }
         if (snapshot_age_s > CATALOG_STALE_WARN_S)
-            stale_days = snapshot_age_s / (24L * 60 * 60);
+            g_fetch.stale_days_unreported = snapshot_age_s / (24L * 60 * 60);
     }
 
     struct fetch_args *args = xcalloc(1, sizeof(*args));
     args->url = xstrdup(url);
     args->path = path;
-    g_fetch_started_ms = monotonic_ms();
-    g_fetch_job = bg_job_spawn(fetch_worker, args);
-    if (!g_fetch_job)
+    g_fetch.generation_at_start = atomic_load(&g_cache_generation);
+    g_fetch.started_ms = monotonic_ms();
+    g_fetch.job = bg_job_spawn(fetch_worker, args);
+    if (!g_fetch.job)
         fetch_args_free(args);
+}
+
+long catalog_stale_days(void)
+{
+    long stale_days = g_fetch.stale_days_unreported;
+    g_fetch.stale_days_unreported = 0;
+    /* A refresh that already landed makes the age history, not a warning. */
+    if (atomic_load(&g_cache_generation) != g_fetch.generation_at_start)
+        return 0;
     return stale_days;
 }
 
-static void wait_fetch(long budget_ms)
+static void wait_fetch(long budget_ms, http_tick_cb tick, void *tick_user)
 {
-    for (long waited_ms = 0; waited_ms < budget_ms && !atomic_load(&g_fetch_done);
+    for (long waited_ms = 0; waited_ms < budget_ms && !atomic_load(&g_fetch.done);
          waited_ms += 20) {
+        if (tick && tick(tick_user))
+            return;
         struct timespec delay = {0, 20 * 1000 * 1000};
         nanosleep(&delay, NULL);
     }
 }
 
-void catalog_wait(long max_wait_ms)
+void catalog_wait(long max_wait_ms, http_tick_cb tick, void *tick_user)
 {
-    if (!g_fetch_job)
+    if (!g_fetch.job)
         return;
     /* Anchored at fetch start so requests during a slow refresh do not each stall in full. */
-    wait_fetch(max_wait_ms - (monotonic_ms() - g_fetch_started_ms));
+    wait_fetch(max_wait_ms - (monotonic_ms() - g_fetch.started_ms), tick, tick_user);
 }
 
 void catalog_drain(long max_wait_ms)
 {
-    if (!g_fetch_job)
+    if (!g_fetch.job)
         return;
     /* Call-relative: the grace is for finishing the fetch, however long it has already run. */
-    wait_fetch(max_wait_ms);
-    if (!atomic_load(&g_fetch_done))
-        bg_job_cancel(g_fetch_job);
-    bg_job_join(g_fetch_job);
-    g_fetch_job = NULL;
+    wait_fetch(max_wait_ms, NULL, NULL);
+    if (!atomic_load(&g_fetch.done))
+        bg_job_cancel(g_fetch.job);
+    bg_job_join(g_fetch.job);
+    g_fetch.job = NULL;
 }
 
 void catalog_shutdown(void)
 {
-    if (g_fetch_job) {
-        bg_job_cancel(g_fetch_job);
-        bg_job_join(g_fetch_job);
-        g_fetch_job = NULL;
+    if (g_fetch.job) {
+        bg_job_cancel(g_fetch.job);
+        bg_job_join(g_fetch.job);
+        g_fetch.job = NULL;
     }
     memo_clear();
     g_memo_generation = atomic_load(&g_cache_generation);
