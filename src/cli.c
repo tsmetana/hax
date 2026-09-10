@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include "buf.h"
+#include "config.h"
 #include "diag.h"
 #include "session.h"
 #include "session_picker.h"
@@ -54,7 +55,8 @@ static const struct help_option {
     {"--effort=LEVEL", "Select the reasoning effort for this run."},
     {"--preset=NAME",
      "Apply the named preset — a presets.NAME selection from the config file. Explicit "
-     "selection flags win over the preset's values."},
+     "selection flags win over the preset's values. The name may also be given right "
+     "after 'hax' in place of this flag."},
     {"-h, --help", "Show this help and exit."},
     {"-v, --version", "Show version and exit."},
 };
@@ -78,7 +80,7 @@ void cli_print_help(void)
     fputc('\n', stdout);
 
     printf("%susage:%s ", bold, reset);
-    ui_wrapped_rows("hax [OPTIONS] [PROMPT...]", (int)strlen("usage: "), columns, "");
+    ui_wrapped_rows("hax [PRESET] [OPTIONS] [PROMPT...]", (int)strlen("usage: "), columns, "");
     fputc('\n', stdout);
 
     ui_wrapped_rows("With no arguments, runs an interactive REPL.", 0, columns, "");
@@ -115,6 +117,37 @@ static const char *empty_selection_flag(const struct cli_selection *selection)
     return NULL;
 }
 
+/* A bare first word that names a preset is a shortcut for --preset. Anything else stays a
+ * positional so the slot remains free for a prompt or, later, other commands. */
+static const char *leading_preset(int argc, char **argv)
+{
+    if (argc < 2 || argv[1][0] == '-' || !config_preset_exists(argv[1]))
+        return NULL;
+    return argv[1];
+}
+
+static void report_unknown_leading_word(const char *word)
+{
+    char **names = NULL;
+    size_t count = config_preset_names(&names);
+
+    struct buf known;
+    buf_init(&known);
+    for (size_t i = 0; i < count; i++) {
+        buf_append_str(&known, i == 0 ? " (presets: " : ", ");
+        buf_append_str(&known, names[i]);
+        free(names[i]);
+    }
+    free(names);
+    if (count > 0)
+        buf_append_str(&known, ")");
+
+    hax_err("'%s' is not a preset%s\n"
+            "A prompt needs -p / --print. Try 'hax --help' for usage.",
+            word, known.data ? known.data : "");
+    buf_free(&known);
+}
+
 enum cli_parse_result cli_parse(int argc, char **argv, struct cli_options *options)
 {
     enum {
@@ -146,12 +179,21 @@ enum cli_parse_result cli_parse(int argc, char **argv, struct cli_options *optio
     };
 
     memset(options, 0, sizeof(*options));
+
+    const char *first_word = argc > 1 ? argv[1] : NULL;
+    const char *preset = leading_preset(argc, argv);
+    int skipped = preset ? 1 : 0;
+    /* getopt names argv[0] in its diagnostics, so shift the program name over the consumed
+     * preset instead of parsing from argv + 1 as-is. */
+    if (preset)
+        argv[1] = argv[0];
     optind = 1;
 
     int saw_continue = 0;
     int saw_resume = 0;
     int option;
-    while ((option = getopt_long(argc, argv, "hpcv", long_options, NULL)) != -1) {
+    while ((option = getopt_long(argc - skipped, argv + skipped, "hpcv", long_options, NULL)) !=
+           -1) {
         switch (option) {
         case 'h':
             cli_print_help();
@@ -204,10 +246,18 @@ enum cli_parse_result cli_parse(int argc, char **argv, struct cli_options *optio
         }
     }
 
+    optind += skipped;
+
     if (saw_continue && saw_resume) {
         hax_err("use only one of --continue / --resume");
         return CLI_PARSE_ERROR;
     }
+    if (preset && options->selection.preset) {
+        hax_err("use only one of a leading preset name / --preset");
+        return CLI_PARSE_ERROR;
+    }
+    if (preset)
+        options->selection.preset = preset;
 
     const char *empty_flag = empty_selection_flag(&options->selection);
     if (empty_flag) {
@@ -223,8 +273,12 @@ enum cli_parse_result cli_parse(int argc, char **argv, struct cli_options *optio
         return CLI_PARSE_ERROR;
     }
     if (!options->one_shot && optind < argc) {
-        hax_err("positional arguments require -p / --print\n"
-                "Try 'hax --help' for usage.");
+        /* getopt permutes argv, so identify the lone word by pointer, not position. */
+        if (!preset && optind == argc - 1 && argv[optind] == first_word)
+            report_unknown_leading_word(first_word);
+        else
+            hax_err("positional arguments require -p / --print\n"
+                    "Try 'hax --help' for usage.");
         return CLI_PARSE_ERROR;
     }
 

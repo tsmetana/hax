@@ -174,9 +174,10 @@ The easiest way to save a favorite is to select it with `/provider`, `/model`, a
 ```
 
 Model availability, pricing, and data policies change; treat these IDs as examples and prefer choices
-shown by your `/model` picker. Apply a preset with `--preset daily`, `HAX_PRESET=review`,
-`/preset review`, or `/new review`. `/preset` offers a picker when no name is given. The active preset
-appears in the banner and `/session`.
+shown by your `/model` picker. Apply a preset with `hax daily`, `--preset daily`,
+`HAX_PRESET=review`, `/preset review`, or `/new review`. The bare form must come right after `hax`
+and only works for a defined preset name. `/preset` offers a picker when no name is given. The
+active preset appears in the banner and `/session`.
 
 Preset fields:
 

@@ -7,6 +7,11 @@ notes (see [docs/releasing.md](docs/releasing.md)).
 
 ## [Unreleased]
 
+### Added
+
+- A preset name right after `hax` starts with that preset: `hax review` is short for
+  `hax --preset review`, and `hax review -p "..."` works the same way in one-shot mode.
+
 ### Changed
 
 - Custom providers no longer take their models.dev catalog identity from their own name; set

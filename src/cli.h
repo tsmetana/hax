@@ -42,7 +42,9 @@ struct cli_options {
     int no_session;
 };
 
-/* Parse and validate argv, initializing `options`. Stored option values borrow argv. */
+/* Parse and validate argv, initializing `options`. A first argument naming a defined preset is
+ * consumed as the run's preset. Stored option values borrow argv, which is reordered as by
+ * getopt. */
 enum cli_parse_result cli_parse(int argc, char **argv, struct cli_options *options);
 
 /* Build the one-shot prompt from positional arguments or `input`. `input_is_tty` is supplied by

@@ -40,7 +40,7 @@ hax --resume=ID -p "continue"    # resume non-interactively
 | `--provider=NAME` | Select a provider for this run. |
 | `--model=ID` | Select a model for this run. |
 | `--effort=LEVEL` | Select reasoning effort for this run. |
-| `--preset=NAME` | Apply a named preset; explicit provider/model/effort flags still win. |
+| `--preset=NAME` | Apply a named preset; explicit provider/model/effort flags still win. `hax NAME` is a shortcut for it. |
 | `-h`, `--help` | Show current CLI help. |
 | `-v`, `--version` | Show the version. |
 

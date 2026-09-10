@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 
 #include "cli.h"
+#include "config.h"
 #include "harness.h"
 #include "provider.h"
 #include "session.h"
@@ -90,6 +91,59 @@ static void test_parse_rejects_missing_values_and_interactive_prompt(void)
 
     char *interactive_prompt[] = {"hax", "hello", NULL};
     EXPECT(cli_parse(2, interactive_prompt, &options) == CLI_PARSE_ERROR);
+}
+
+static void test_parse_leading_preset(void)
+{
+    EXPECT(config_load("{\"presets\": {\"review\": {\"provider\": \"test\"}, "
+                       "\"daily\": {\"provider\": \"test\"}}}") == 0);
+    struct cli_options options;
+
+    char *interactive[] = {"hax", "review", NULL};
+    EXPECT(cli_parse(2, interactive, &options) == CLI_PARSE_OK);
+    EXPECT_STR_EQ(options.selection.preset, "review");
+    EXPECT(options.one_shot == 0);
+
+    char *with_flags[] = {"hax", "review", "-c", "--model=m", NULL};
+    EXPECT(cli_parse(4, with_flags, &options) == CLI_PARSE_OK);
+    EXPECT_STR_EQ(options.selection.preset, "review");
+    EXPECT_STR_EQ(options.selection.model, "m");
+    EXPECT(options.resume_mode == CLI_RESUME_LATEST);
+
+    char *oneshot[] = {"hax", "review", "-p", "fix", "the", "tests", NULL};
+    EXPECT(cli_parse(6, oneshot, &options) == CLI_PARSE_OK);
+    EXPECT_STR_EQ(options.selection.preset, "review");
+    char *prompt = NULL;
+    EXPECT(cli_read_prompt(&options, 6, oneshot, stdin, 1, &prompt) == 0);
+    EXPECT_STR_EQ(prompt, "fix the tests");
+    free(prompt);
+
+    /* Only the word right after the program name is a preset; later ones are prompt text. */
+    char *after_print[] = {"hax", "-p", "review", "fix", NULL};
+    EXPECT(cli_parse(4, after_print, &options) == CLI_PARSE_OK);
+    EXPECT(options.selection.preset == NULL);
+    EXPECT(cli_read_prompt(&options, 4, after_print, stdin, 1, &prompt) == 0);
+    EXPECT_STR_EQ(prompt, "review fix");
+    free(prompt);
+
+    char *after_flag[] = {"hax", "-c", "review", NULL};
+    EXPECT(cli_parse(3, after_flag, &options) == CLI_PARSE_ERROR);
+
+    char *both_forms[] = {"hax", "review", "--preset=daily", NULL};
+    EXPECT(cli_parse(3, both_forms, &options) == CLI_PARSE_ERROR);
+
+    char *unknown[] = {"hax", "reviw", NULL};
+    EXPECT(cli_parse(2, unknown, &options) == CLI_PARSE_ERROR);
+
+    /* A first word that is not a preset keeps its prompt meaning. */
+    char *trailing_print[] = {"hax", "fix", "the", "tests", "-p", NULL};
+    EXPECT(cli_parse(5, trailing_print, &options) == CLI_PARSE_OK);
+    EXPECT(options.selection.preset == NULL);
+    EXPECT(cli_read_prompt(&options, 5, trailing_print, stdin, 1, &prompt) == 0);
+    EXPECT_STR_EQ(prompt, "fix the tests");
+    free(prompt);
+
+    EXPECT(config_load(NULL) == 0);
 }
 
 static void test_parse_json_implies_print(void)
@@ -386,6 +440,7 @@ int main(void)
     test_parse_resume_modes();
     test_parse_rejects_incompatible_resume_options();
     test_parse_rejects_missing_values_and_interactive_prompt();
+    test_parse_leading_preset();
     test_parse_json_implies_print();
     test_parse_version_prints_and_exits();
     test_help_wraps_to_display_width();
