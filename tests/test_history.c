@@ -7,6 +7,7 @@
 
 #include "agent_core.h"
 #include "agent_dispatch.h"
+#include "config.h"
 #include "harness.h"
 #include "history.h"
 #include "provider.h"
@@ -16,6 +17,7 @@
 #include "render/render_ctx.h"
 #include "system/locale.h"
 #include "terminal/vt_resolve.h"
+#include "text/width.h"
 
 /* Render through the paged-history sink and resolver. Markdown stays disabled so assertions do
  * not depend on wrapping. Caller frees. */
@@ -349,7 +351,85 @@ static void test_nameless_call_renders_in_both_modes(void)
 
     char *brief = render(HISTORY_BRIEF, items, 2, 0);
     EXPECT(strstr(brief, "[?]") != NULL);
+    EXPECT(strstr(brief, "NAMELESS_ARG") != NULL);
     free(brief);
+}
+
+/* task_wait derives its whole argument through format_argument, with no single named JSON
+ * argument to fall back on; the quiet brief line must still show what was waited on. */
+static void test_brief_shows_formatted_only_argument(void)
+{
+    struct item items[2] = {0};
+    items[0].kind = ITEM_TOOL_CALL;
+    items[0].call_id = (char *)"w";
+    items[0].tool_name = (char *)"task_wait";
+    items[0].tool_arguments_json = (char *)"{\"id\":\"tests-asan\",\"timeout_seconds\":600}";
+    items[1].kind = ITEM_TOOL_RESULT;
+    items[1].call_id = (char *)"w";
+    items[1].output = (char *)"[tests-asan finished (exit 0) after 12s]\n";
+
+    char *brief = render(HISTORY_BRIEF, items, 2, 0);
+    EXPECT(strstr(brief, "[task_wait]") != NULL);
+    EXPECT(strstr(brief, "tests-asan (up to 10m)") != NULL);
+    free(brief);
+
+    char *full = render(HISTORY_FULL, items, 2, 0);
+    EXPECT(strstr(full, "tests-asan (up to 10m)") != NULL);
+    free(full);
+}
+
+/* Both header styles reserve room for the tool's suffix, so an overlong argument is what gets
+ * truncated: a collapsed read still shows its line range at the end of the row. */
+static void test_collapsed_row_keeps_suffix_under_truncation(void)
+{
+    char basename[201];
+    memset(basename, 'a', sizeof(basename) - 1);
+    basename[sizeof(basename) - 1] = '\0';
+    char *args = xasprintf("{\"path\":\"/tmp/%s.h\",\"offset\":10,\"limit\":20}", basename);
+    struct item items[1] = {0};
+    items[0].kind = ITEM_TOOL_CALL;
+    items[0].call_id = (char *)"r";
+    items[0].tool_name = (char *)"read";
+    items[0].tool_arguments_json = args;
+
+    char *out = render(HISTORY_BRIEF, items, 1, 0);
+    char *plain = strip_sgr(out);
+    const char *ellipsis = strstr(plain, "...");
+    const char *range = strstr(plain, ":10-29");
+    EXPECT(ellipsis != NULL && range != NULL && ellipsis < range);
+    free(plain);
+    free(out);
+    free(args);
+}
+
+/* A suffix as wide as the row must not push a collapsed read past the one-cell autowrap
+ * margin: the suffix is capped so the argument keeps its ellipsis and the row its budget. */
+static void test_collapsed_row_stays_in_budget_at_narrow_width(void)
+{
+    struct item items[1] = {0};
+    items[0].kind = ITEM_TOOL_CALL;
+    items[0].call_id = (char *)"r";
+    items[0].tool_name = (char *)"read";
+    items[0].tool_arguments_json =
+        (char *)"{\"path\":\"/tmp/example.txt\",\"offset\":10000,\"limit\":20}";
+
+    config_set_override("display_width", "20");
+    char *out = render(HISTORY_BRIEF, items, 1, 0);
+    config_set_override("display_width", NULL);
+
+    char *plain = strip_sgr(out);
+    char *row = strstr(plain, "[read]");
+    EXPECT(row != NULL);
+    if (row) {
+        char *end = strchr(row, '\n');
+        if (end)
+            *end = '\0';
+        EXPECT(display_cells(row) <= 19);
+        EXPECT(strstr(row, "[read] e...") != NULL);
+        EXPECT(strstr(row, ":1") != NULL);
+    }
+    free(plain);
+    free(out);
 }
 
 /* Dispatch displays the preprocessed args, not the model's emission that
@@ -991,6 +1071,9 @@ int main(void)
     test_collapsed_cluster_spans_turns_tightly();
     test_brief_names_verbose_tool_args();
     test_nameless_call_renders_in_both_modes();
+    test_brief_shows_formatted_only_argument();
+    test_collapsed_row_keeps_suffix_under_truncation();
+    test_collapsed_row_stays_in_budget_at_narrow_width();
     test_replays_preprocessed_args();
     test_skipped_call_replays_its_outcome();
     test_ran_call_printing_a_marker_is_not_undispatched();

@@ -22,6 +22,8 @@
 
 #define HEADER_EXTRA_MAX_CELLS 20
 #define MIN_DISPLAY_CELLS      8
+/* One character plus an ellipsis, so a suffix never squeezes the argument to a bare cut. */
+#define MIN_ARGUMENT_CELLS 4
 
 static const char *tool_name(const struct item *call)
 {
@@ -68,82 +70,123 @@ static char *display_argument(const struct tool *tool, const char *args_json)
     return argument;
 }
 
-static char *display_extra(const struct tool *tool, const char *args_json, int terminal_width)
-{
-    if (!tool || !tool->display.format_extra)
-        return NULL;
-    char *extra = tool->display.format_extra(args_json);
-    if (!extra || !*extra)
-        return extra;
+/* What follows the tool tag, resolved once per call so every header style consults the tool's
+ * display hooks identically and lays the pieces out the same way. Members are owned. */
+struct header_text {
+    /* Flattened to one line; NULL when the call carried no arguments. */
+    char *argument;
+    /* Dim suffix the layout keeps intact under truncation; NULL when absent or for raw JSON. */
+    char *extra;
+    /* The argument is the JSON payload itself because no display hook derived one. */
+    int raw;
+};
 
+/* Row cells left for content after the tag, floored so a narrow pane still shows something. */
+static int row_budget(int cells)
+{
+    return cells < MIN_DISPLAY_CELLS ? MIN_DISPLAY_CELLS : cells;
+}
+
+/* Consumes the tool-formatted suffix; an empty one becomes NULL. The cap leaves the argument
+ * its minimum share of the first row, so the row never exceeds its budget. */
+static char *capped_extra(char *extra, int first_row_cells)
+{
+    if (!extra)
+        return NULL;
+    if (!*extra) {
+        free(extra);
+        return NULL;
+    }
     int max_cells = HEADER_EXTRA_MAX_CELLS;
-    if (max_cells > terminal_width - MIN_DISPLAY_CELLS)
-        max_cells = terminal_width - MIN_DISPLAY_CELLS;
-    if (max_cells < 4)
-        max_cells = 4;
+    if (max_cells > first_row_cells - MIN_ARGUMENT_CELLS)
+        max_cells = first_row_cells - MIN_ARGUMENT_CELLS;
     if ((int)display_cells(extra) <= max_cells)
         return extra;
-
     char *trimmed = truncate_for_display(extra, (size_t)max_cells);
     free(extra);
     return trimmed;
+}
+
+/* Collapsed rows apply the tool's collapse rewrite so coalesced calls scan as a list.
+ * first_row_cells is the budget the caller will lay the first row out with. */
+static struct header_text header_text_resolve(const struct tool *tool, const struct item *call,
+                                              int collapsed, int first_row_cells)
+{
+    struct header_text text = {0};
+    const char *args_json = call->tool_arguments_json;
+    char *argument = display_argument(tool, args_json);
+    if (argument && collapsed && tool->display.collapse_argument) {
+        char *rewritten = tool->display.collapse_argument(argument);
+        free(argument);
+        argument = rewritten;
+    }
+    if (argument) {
+        if (tool->display.format_extra)
+            text.extra = capped_extra(tool->display.format_extra(args_json), first_row_cells);
+    } else {
+        if (!args_json || !*args_json)
+            return text;
+        text.raw = 1;
+        argument = xstrdup(args_json);
+    }
+    text.argument = flatten_for_display(argument);
+    free(argument);
+    return text;
+}
+
+static void header_text_free(struct header_text *text)
+{
+    free(text->argument);
+    free(text->extra);
+}
+
+static int header_text_extra_cells(const struct header_text *text)
+{
+    return text->extra ? (int)display_cells(text->extra) : 0;
+}
+
+/* Fit the argument into the row budgets, leaving room for the suffix on whichever row ends up
+ * last. Caller frees. */
+static char *header_text_layout(const struct header_text *text, int first_row_cells,
+                                int other_row_cells, int max_rows)
+{
+    return reflow_for_display(text->argument, first_row_cells, other_row_cells, max_rows,
+                              header_text_extra_cells(text));
+}
+
+static void write_header_extra(struct disp *disp, const struct header_text *text)
+{
+    if (!text->extra)
+        return;
+    disp_write_ansi(disp, ANSI_DIM);
+    disp_write(disp, text->extra, strlen(text->extra));
+    disp_write_ansi(disp, ANSI_RESET);
 }
 
 static void write_tool_header(struct disp *disp, const struct item *call)
 {
     const char *name = tool_name(call);
     const struct tool *tool = agent_find_tool(name);
-    char *argument = display_argument(tool, call->tool_arguments_json);
     int terminal_width = display_width();
-    int tag_cells = tool_tag_cells(name);
+    int first_row_cells = row_budget(terminal_width - tool_tag_cells(name));
+    struct header_text text = header_text_resolve(tool, call, 0, first_row_cells);
 
     disp_block_separator(disp);
     disp_write_ansi(disp, theme_open(THEME_CHROME));
     disp_printf(disp, "[%s]", name);
     disp_write_ansi(disp, ANSI_RESET);
 
-    if (argument) {
-        char *extra = display_extra(tool, call->tool_arguments_json, terminal_width);
-        int extra_cells = extra ? (int)display_cells(extra) : 0;
-        int rows = tool->display.header_rows > 0 ? tool->display.header_rows : 1;
-        int first_row_width = terminal_width - tag_cells;
-        if (first_row_width < MIN_DISPLAY_CELLS)
-            first_row_width = MIN_DISPLAY_CELLS;
-        int continuation_width = terminal_width;
-        if (continuation_width < MIN_DISPLAY_CELLS)
-            continuation_width = MIN_DISPLAY_CELLS;
-
-        char *flattened = flatten_for_display(argument);
-        char *layout =
-            reflow_for_display(flattened, first_row_width, continuation_width, rows, extra_cells);
-        free(flattened);
-
+    if (text.argument) {
+        int rows = !text.raw && tool->display.header_rows > 0 ? tool->display.header_rows : 1;
+        char *layout = header_text_layout(&text, first_row_cells, row_budget(terminal_width), rows);
         disp_putc(disp, ' ');
-        disp_write_ansi(disp, ANSI_BOLD);
+        disp_write_ansi(disp, text.raw ? ANSI_DIM : ANSI_BOLD);
         disp_write(disp, layout, strlen(layout));
         disp_write_ansi(disp, ANSI_RESET);
         free(layout);
-        if (extra && *extra) {
-            disp_write_ansi(disp, ANSI_DIM);
-            disp_write(disp, extra, strlen(extra));
-            disp_write_ansi(disp, ANSI_RESET);
-        }
-        free(extra);
-    } else if (call->tool_arguments_json && *call->tool_arguments_json) {
-        int available_cells = terminal_width - tag_cells;
-        if (available_cells < MIN_DISPLAY_CELLS)
-            available_cells = MIN_DISPLAY_CELLS;
-        char *flattened = flatten_for_display(call->tool_arguments_json);
-        char *trimmed = truncate_for_display(flattened, (size_t)available_cells);
-        free(flattened);
-
-        disp_putc(disp, ' ');
-        disp_write_ansi(disp, ANSI_DIM);
-        disp_write(disp, trimmed, strlen(trimmed));
-        disp_write_ansi(disp, ANSI_RESET);
-        free(trimmed);
+        write_header_extra(disp, &text);
     }
-    free(argument);
+    header_text_free(&text);
 
     disp_putc(disp, '\n');
     /* Commit the newline before the spinner or output can overprint it. */
@@ -151,11 +194,14 @@ static void write_tool_header(struct disp *disp, const struct item *call)
     disp_flush(disp);
 }
 
-/* Read headers remain open so later reads can coalesce on the same row. */
-static int write_collapsed_header(struct disp *disp, const struct item *call, const char *argument)
+/* Read headers remain open so later reads can coalesce on the same row. Returns the cells the
+ * row occupies. */
+static int write_collapsed_header(struct disp *disp, const struct item *call,
+                                  const struct header_text *text, int row_cells)
 {
     const char *name = tool_name(call);
     int cells = tool_tag_cells(name);
+    char *layout = header_text_layout(text, row_cells, row_cells, 1);
 
     disp_write_ansi(disp, theme_open(THEME_CHROME_DIM));
     disp_printf(disp, "[%s]", name);
@@ -163,64 +209,34 @@ static int write_collapsed_header(struct disp *disp, const struct item *call, co
     disp_write_ansi(disp, theme_close(THEME_CHROME_DIM));
     disp_write_ansi(disp, ANSI_DIM);
     disp_putc(disp, ' ');
-    if (argument && *argument) {
-        disp_write(disp, argument, strlen(argument));
-        cells += (int)display_cells(argument);
-    }
+    disp_write(disp, layout, strlen(layout));
+    cells += (int)display_cells(layout);
     disp_write_ansi(disp, ANSI_RESET);
+    free(layout);
+    write_header_extra(disp, text);
+    cells += header_text_extra_cells(text);
     disp_commit_newlines(disp);
     disp_flush(disp);
     return cells;
 }
 
-static int append_collapsed_argument(struct disp *disp, const char *argument)
+/* Cells a call appended to an open row would occupy. */
+static int coalesced_cells(const struct header_text *text)
+{
+    return 2 + (int)display_cells(text->argument) + header_text_extra_cells(text);
+}
+
+static int append_collapsed_argument(struct disp *disp, const struct header_text *text)
 {
     disp_write_ansi(disp, ANSI_DIM);
     disp_write(disp, ", ", 2);
-    disp_write(disp, argument, strlen(argument));
+    if (text->argument)
+        disp_write(disp, text->argument, strlen(text->argument));
     disp_write_ansi(disp, ANSI_RESET);
+    write_header_extra(disp, text);
     disp_commit_newlines(disp);
     disp_flush(disp);
-    return 2 + (int)display_cells(argument);
-}
-
-/* Collapsed rows are single-line; tools may rewrite the argument so coalesced calls scan
- * as a list. */
-static char *collapsed_argument(const struct tool *tool, const struct item *call)
-{
-    if (!tool || !tool->display.arg_name || !call->tool_arguments_json)
-        return xstrdup("");
-
-    char *argument = display_argument(tool, call->tool_arguments_json);
-    if (tool->display.collapse_argument) {
-        char *collapsed = tool->display.collapse_argument(argument);
-        free(argument);
-        argument = collapsed;
-    }
-    if (!argument)
-        return xstrdup("");
-
-    char *extra =
-        tool->display.format_extra ? tool->display.format_extra(call->tool_arguments_json) : NULL;
-    char *with_extra = extra && *extra ? xasprintf("%s%s", argument, extra) : xstrdup(argument);
-    free(extra);
-    free(argument);
-    char *flattened = flatten_for_display(with_extra);
-    free(with_extra);
-    return flattened;
-}
-
-/* Keep one cell free to avoid deferred terminal autowrap. */
-static char *truncate_collapsed_argument(const struct tool *tool, const struct item *call,
-                                         int tag_cells, int terminal_width)
-{
-    int available_cells = terminal_width - tag_cells - 1;
-    if (available_cells < MIN_DISPLAY_CELLS)
-        available_cells = MIN_DISPLAY_CELLS;
-    char *argument = collapsed_argument(tool, call);
-    char *trimmed = truncate_for_display(argument, (size_t)available_cells);
-    free(argument);
-    return trimmed;
+    return coalesced_cells(text);
 }
 
 void render_tool_call_header(struct render_ctx *render, const struct item *call)
@@ -281,29 +297,24 @@ static void write_cluster_line(struct render_ctx *render, const struct item *cal
     int can_coalesce = render->cluster.line_open && render->cluster.last_tool &&
                        strcmp(render->cluster.last_tool, "read") == 0 && is_read;
 
+    /* Keep one cell free to avoid deferred terminal autowrap on an open row. */
+    int row_cells = row_budget(terminal_width - tool_tag_cells(tool_name(call)) - 1);
+    struct header_text text = header_text_resolve(tool, call, 1, row_cells);
     if (can_coalesce) {
-        char *argument = collapsed_argument(tool, call);
-        int appended_cells = 2 + (int)display_cells(argument);
-        if (render->cluster.line_cells + appended_cells > terminal_width - 1) {
+        if (render->cluster.line_cells + coalesced_cells(&text) > terminal_width - 1) {
             close_collapsed_line(disp);
-            char *trimmed = truncate_collapsed_argument(tool, call, tool_tag_cells(tool_name(call)),
-                                                        terminal_width);
-            render->cluster.line_cells = write_collapsed_header(disp, call, trimmed);
-            free(trimmed);
+            render->cluster.line_cells = write_collapsed_header(disp, call, &text, row_cells);
         } else {
-            render->cluster.line_cells += append_collapsed_argument(disp, argument);
+            render->cluster.line_cells += append_collapsed_argument(disp, &text);
         }
-        free(argument);
     } else {
         if (render->cluster.line_open)
             close_collapsed_line(disp);
-        char *trimmed = truncate_collapsed_argument(tool, call, tool_tag_cells(tool_name(call)),
-                                                    terminal_width);
-        render->cluster.line_cells = write_collapsed_header(disp, call, trimmed);
-        free(trimmed);
+        render->cluster.line_cells = write_collapsed_header(disp, call, &text, row_cells);
         if (!is_read)
             close_collapsed_line(disp);
     }
+    header_text_free(&text);
     render->cluster.line_open = is_read;
     render->cluster.last_tool = tool ? tool->def.name : NULL;
 }

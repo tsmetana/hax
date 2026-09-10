@@ -7,6 +7,12 @@ notes (see [docs/releasing.md](docs/releasing.md)).
 
 ## [Unreleased]
 
+### Fixed
+
+- The brief history shown on resume now names the task a `task_wait` call waited on, as the
+  live header does, instead of a bare `[task_wait]` line. Collapsed tool rows that need
+  truncation now keep their suffix, such as a read's line range, like the full header does.
+
 ## [0.5.0] - 2026-09-04
 
 ### Added
