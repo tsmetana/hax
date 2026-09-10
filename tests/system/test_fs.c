@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: MIT */
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -552,8 +553,65 @@ static void test_read_file_capped_exact(void)
     free(path);
 }
 
+static void test_write_atomic_bytes_mode_and_symlink(void)
+{
+    const char *dir = t_tempdir();
+    char *path = path_join(dir, "nested/file");
+    char *link = path_join(dir, "link");
+    const char content[] = {'a', '\0', 'b'};
+    EXPECT(symlink("nested/file", link) == 0);
+
+    for (int durable = 0; durable <= 1; durable++) {
+        EXPECT(fs_write_atomic(link, content, sizeof(content), durable) == 0);
+        size_t length = 0;
+        char *body = fs_read_file(path, &length);
+        EXPECT(body != NULL);
+        if (body)
+            EXPECT_MEM_EQ(body, length, content, sizeof(content));
+        free(body);
+        struct stat st;
+        EXPECT(lstat(link, &st) == 0 && S_ISLNK(st.st_mode));
+
+        /* The parent exists before the restrictive umask, so only file creation is tested. */
+        mode_t mask = umask(0777);
+        int result = fs_write_atomic(link, "", 0, durable);
+        umask(mask);
+        EXPECT(result == 0);
+        EXPECT(stat(path, &st) == 0 && (st.st_mode & 0777) == 0600 && st.st_size == 0);
+    }
+    free(link);
+    free(path);
+}
+
+static void test_write_atomic_failure_cleanup(void)
+{
+    const char *dir = t_tempdir();
+    char *path = path_join(dir, "destination");
+    EXPECT(mkdir(path, 0755) == 0);
+    for (int durable = 0; durable <= 1; durable++) {
+        errno = 0;
+        EXPECT(fs_write_atomic(path, "new", 3, durable) == -1);
+        EXPECT(errno == EISDIR);
+        struct stat st;
+        EXPECT(stat(path, &st) == 0 && S_ISDIR(st.st_mode));
+        DIR *entries = opendir(dir);
+        EXPECT(entries != NULL);
+        if (entries) {
+            struct dirent *entry;
+            while ((entry = readdir(entries)))
+                EXPECT(strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0 ||
+                       strcmp(entry->d_name, "destination") == 0);
+            closedir(entries);
+        }
+    }
+    free(path);
+}
+
 int main(void)
 {
+    test_write_atomic_bytes_mode_and_symlink();
+    test_write_atomic_failure_cleanup();
+
     test_which_finds_sh();
     test_which_missing_is_null();
     test_which_slash_passes_through();

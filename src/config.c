@@ -4,14 +4,11 @@
 #include <ctype.h>
 #include <errno.h>
 #include <jansson.h>
-#include <libgen.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <unistd.h>
-#include <sys/stat.h>
 
 #include "diag.h"
 #include "provider.h"
@@ -1170,55 +1167,13 @@ static void set_nested(json_t *root, const char *key, const char *value)
 
 static int write_json_atomic(const char *path, json_t *object)
 {
-    int result = -1;
-    int fd = -1;
-    FILE *file = NULL;
-    char *temp_path = NULL;
-
-    /* Renaming onto config.json would replace a symlink instead of updating its target. */
-    char *destination = fs_resolve_link_target(path);
-    if (!destination)
+    char *body = json_dumps(object, JSON_INDENT(2) | JSON_PRESERVE_ORDER);
+    if (!body)
         return -1;
-
-    char *directory = xstrdup(destination);
-    fs_mkdir_p(dirname(directory));
-    free(directory);
-
-    temp_path = xasprintf("%s.tmp.XXXXXX", destination);
-    fd = mkstemp(temp_path);
-    if (fd < 0)
-        goto out;
-
-    /* fchmod preserves the 0600 contract even under a restrictive process umask. */
-    if (fchmod(fd, 0600) != 0)
-        goto out;
-
-    file = fdopen(fd, "w");
-    if (!file)
-        goto out;
-    fd = -1;
-
-    if (json_dumpf(object, file, JSON_INDENT(2) | JSON_PRESERVE_ORDER) != 0)
-        goto out;
-    if (fclose(file) != 0) {
-        file = NULL;
-        goto out;
-    }
-    file = NULL;
-
-    if (rename(temp_path, destination) != 0)
-        goto out;
-    result = 0;
-
-out:
-    if (file)
-        fclose(file);
-    if (fd >= 0)
-        close(fd);
-    if (result != 0 && temp_path)
-        unlink(temp_path);
-    free(temp_path);
-    free(destination);
+    char *with_newline = xasprintf("%s\n", body);
+    free(body);
+    int result = fs_write_atomic(path, with_newline, strlen(with_newline), 1);
+    free(with_newline);
     return result;
 }
 

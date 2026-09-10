@@ -4,20 +4,24 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <jansson.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/file.h>
 
 #include "xalloc.h"
-#include "system/fd.h"
 #include "system/fs.h"
 #include "system/path.h"
 
 char *cred_store_file_path(void)
 {
-    return xdg_hax_state_path("auth.json");
+    char *path = xdg_hax_state_path("auth.json");
+    if (!path)
+        return NULL;
+    /* Aliases must share the destination's sidecar lock for the whole transaction. */
+    char *destination = fs_resolve_link_target(path);
+    free(path);
+    return destination;
 }
 
 static int ensure_parent_dir(const char *path)
@@ -74,65 +78,18 @@ static json_t *load_root(const char *path)
     return root;
 }
 
-/* Flush the directory entry after a rename so a crash cannot resurrect the replaced file. */
-static void sync_parent_dir(const char *path)
-{
-    const char *slash = strrchr(path, '/');
-    if (!slash)
-        return;
-    char *parent = xstrdup(path);
-    parent[slash - path] = '\0';
-    int fd = open(parent, O_RDONLY | O_CLOEXEC);
-    free(parent);
-    if (fd < 0)
-        return;
-    /* Best-effort: not every filesystem supports directory fsync. */
-    fsync(fd);
-    close(fd);
-}
-
-/* mkstemp creates the temporary file with mode 0600, which is also the mode credentials need, so
- * the rename never exposes a readable window. The fsync before rename is load-bearing: a rotated
- * refresh token restored from a stale page after a crash is spent and unrecoverable. */
+/* fsync-before-rename is load-bearing: a rotated refresh token restored from a stale page after a
+ * crash is spent and unrecoverable. */
 static int save_root(const char *path, json_t *root)
 {
-    if (ensure_parent_dir(path) != 0)
-        return -1;
-
     char *body = json_dumps(root, JSON_INDENT(2) | JSON_SORT_KEYS);
     if (!body)
         return -1;
-
-    char *temp_path = xasprintf("%s.XXXXXX", path);
-    int fd = mkstemp(temp_path);
-    if (fd < 0)
-        goto err_body;
-
-    if (fd_write_all(fd, body, strlen(body)) != 0 || fd_write_all(fd, "\n", 1) != 0)
-        goto err_fd;
-    if (fsync(fd) != 0)
-        goto err_fd;
-    if (close(fd) != 0) {
-        fd = -1;
-        goto err_fd;
-    }
-    fd = -1;
-    if (rename(temp_path, path) != 0)
-        goto err_fd;
-    sync_parent_dir(path);
-
-    free(temp_path);
+    char *with_newline = xasprintf("%s\n", body);
     free(body);
-    return 0;
-
-err_fd:
-    if (fd >= 0)
-        close(fd);
-    unlink(temp_path);
-    free(temp_path);
-err_body:
-    free(body);
-    return -1;
+    int result = fs_write_atomic(path, with_newline, strlen(with_newline), 1);
+    free(with_newline);
+    return result;
 }
 
 json_t *cred_store_get(const char *provider_id)

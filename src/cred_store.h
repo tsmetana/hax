@@ -10,7 +10,8 @@
  * serializes against other hax processes through an advisory lock. Foreground-thread state:
  * resolve entries before spawning background work. */
 
-/* Resolved store path for diagnostics, or NULL when no home is available. The caller frees. */
+/* Store path with symlink chains resolved, shared by diagnostics and transactions. Returns NULL
+ * when no home is available or resolution fails. The caller frees. */
 char *cred_store_file_path(void);
 
 /* Return the owned entry for `provider_id`, or NULL when absent or unreadable. */

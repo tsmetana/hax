@@ -195,43 +195,48 @@ static char *make_write_diff(const char *path, const char *old_content, size_t o
 }
 
 static char *stage_write(const char *parent, const char *content, size_t content_len, mode_t mode,
-                         char **error)
+                         int sync_file, char **error)
 {
     char *temp_path = path_join(parent, ".hax-write-XXXXXX");
+    const char *operation = "mkstemp";
+    int saved_errno;
     int fd = mkstemp(temp_path);
     if (fd < 0) {
-        *error = xasprintf("mkstemp: %s", strerror(errno));
-        free(temp_path);
-        return NULL;
+        saved_errno = errno;
+        goto out;
     }
 
-    if (fd_write_all(fd, content, content_len) < 0) {
-        *error = xasprintf("write %s: %s", temp_path, strerror(errno));
+    operation = "write";
+    if (fd_write_all(fd, content, content_len) < 0)
         goto error;
-    }
 
-    /* write(2) may clear set-ID bits, so restore the destination mode afterward. */
-    if (fchmod(fd, mode) < 0) {
-        *error = xasprintf("chmod %s: %s", temp_path, strerror(errno));
+    /* Restore set-ID bits cleared by write(2), and permissions masked by umask at creation. */
+    operation = "chmod";
+    if (fchmod(fd, mode) < 0)
         goto error;
+    if (sync_file) {
+        /* Surface delayed-allocation failures before replacing the destination. */
+        operation = "fsync";
+        if (fsync(fd) < 0)
+            goto error;
     }
-    /* Surface delayed-allocation failures before replacing the destination. */
-    if (fsync(fd) < 0) {
-        *error = xasprintf("fsync %s: %s", temp_path, strerror(errno));
-        goto error;
-    }
+    operation = "close";
     if (close(fd) < 0) {
         fd = -1; /* A failed close leaves the descriptor state unspecified. */
-        *error = xasprintf("close %s: %s", temp_path, strerror(errno));
         goto error;
     }
     return temp_path;
 
 error:
+    saved_errno = errno;
     if (fd >= 0)
         close(fd);
     unlink(temp_path);
+out:
+    if (error)
+        *error = xasprintf("%s %s: %s", operation, temp_path, strerror(saved_errno));
     free(temp_path);
+    errno = saved_errno;
     return NULL;
 }
 
@@ -271,7 +276,7 @@ char *fs_write_with_diff(const char *path, const char *content, size_t content_l
         goto out;
     }
 
-    temp_path = stage_write(parent, content, content_len, target.mode, error);
+    temp_path = stage_write(parent, content, content_len, target.mode, 1, error);
     if (!temp_path)
         goto out;
     if (rename(temp_path, target_path) < 0) {
@@ -292,6 +297,51 @@ out:
     if (was_created)
         *was_created = !target.existed;
     return diff;
+}
+
+/* Best-effort: not every filesystem supports directory fsync. */
+static void fsync_parent_dir(const char *path)
+{
+    char *parent = parent_dir(path);
+    int fd = open(parent, O_RDONLY | O_CLOEXEC);
+    free(parent);
+    if (fd < 0)
+        return;
+    fsync(fd);
+    close(fd);
+}
+
+int fs_write_atomic(const char *path, const char *body, size_t body_len, int durable)
+{
+    int saved_errno;
+    int result = -1;
+    char *temp_path = NULL;
+    char *destination = fs_resolve_link_target(path);
+    if (!destination)
+        return -1;
+    char *directory = parent_dir(destination);
+
+    if (fs_mkdir_p(directory) < 0)
+        goto out;
+    temp_path = stage_write(directory, body, body_len, 0600, durable, NULL);
+    if (!temp_path)
+        goto out;
+    if (rename(temp_path, destination) != 0)
+        goto out;
+
+    if (durable)
+        fsync_parent_dir(destination);
+    result = 0;
+
+out:
+    saved_errno = errno;
+    if (result != 0 && temp_path)
+        unlink(temp_path);
+    free(temp_path);
+    free(directory);
+    free(destination);
+    errno = saved_errno;
+    return result;
 }
 
 static int is_executable_file(const char *path)
@@ -412,34 +462,7 @@ static ssize_t read_retry(int fd, void *data, size_t length)
 
 char *fs_read_file(const char *path, size_t *out_len)
 {
-    int saved_errno;
-    int fd = fs_open_regular(path);
-    if (fd < 0)
-        return NULL;
-
-    struct buf contents;
-    buf_init(&contents);
-    char chunk[8192];
-    for (;;) {
-        ssize_t bytes_read = read_retry(fd, chunk, sizeof(chunk));
-        if (bytes_read < 0)
-            goto error;
-        if (bytes_read == 0)
-            break;
-        buf_append(&contents, chunk, (size_t)bytes_read);
-    }
-
-    close(fd);
-    if (out_len)
-        *out_len = contents.len;
-    return buf_steal(&contents);
-
-error:
-    saved_errno = errno;
-    buf_free(&contents);
-    close(fd);
-    errno = saved_errno;
-    return NULL;
+    return fs_read_file_capped(path, SIZE_MAX, out_len, NULL);
 }
 
 char *fs_read_file_capped(const char *path, size_t cap, size_t *out_len, int *out_truncated)

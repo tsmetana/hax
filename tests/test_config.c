@@ -362,6 +362,14 @@ static void test_persist_selection(void)
 
     /* A full pick lands as one write and reads back. */
     EXPECT(config_persist_selection("codex", "gpt-x", "high") == 0);
+
+    char *state_path = xasprintf("%s/hax/state.json", dir);
+    size_t state_len = 0;
+    char *state_body = fs_read_file(state_path, &state_len);
+    free(state_path);
+    EXPECT(state_body && state_len > 0 && state_body[state_len - 1] == '\n');
+    free(state_body);
+
     EXPECT_STR_EQ(config_str("provider"), "codex");
     EXPECT_STR_EQ(config_str("model"), "gpt-x");
     EXPECT_STR_EQ(config_str("effort"), "high");
@@ -531,6 +539,10 @@ static void test_persist_roundtrip(void)
      * private no matter what mode a stale temp file might have had. */
     char cfgpath[4096];
     snprintf(cfgpath, sizeof cfgpath, "%s/hax/config.json", dir);
+    size_t config_len = 0;
+    char *config_body = fs_read_file(cfgpath, &config_len);
+    EXPECT(config_body && config_len > 0 && config_body[config_len - 1] == '\n');
+    free(config_body);
     struct stat st;
     EXPECT(stat(cfgpath, &st) == 0 && (st.st_mode & 0777) == 0600);
 

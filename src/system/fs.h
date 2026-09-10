@@ -15,11 +15,20 @@ int fs_mkdir_p(const char *path);
 char *fs_resolve_link_target(const char *path);
 
 /* Atomically replace `path` and return an allocated unified diff. Existing file modes are
- * preserved, missing parent directories are created, and unchanged files retain their inode.
+ * preserved, symlink chains are followed, and missing parent directories are created. Unchanged
+ * files retain their inode; changed files are synced before rename.
  * Returns NULL on failure and stores an allocated explanation in `*error`. When non-NULL,
  * `*was_created` reports whether the successful write created a file rather than replacing one. */
 char *fs_write_with_diff(const char *path, const char *content, size_t content_len, char **error,
                          int *was_created);
+
+/* Atomically replace `path` with `body`: write to a sibling temporary file and rename it over the
+ * destination, resolving symlink chains first so a link is updated through rather than replaced.
+ * Missing parent directories are created and the file is private (0600) regardless of the process
+ * umask. With `durable`, require file fsync before rename and attempt parent-directory fsync
+ * afterward (best-effort; errors are ignored). Returns 0 on success and -1 with errno set on
+ * failure; failures before rename leave the destination unchanged. */
+int fs_write_atomic(const char *path, const char *body, size_t body_len, int durable);
 
 /* Resolve `name` against PATH and return the first executable regular file as an allocated path.
  * Names containing '/' are checked directly. Empty and relative PATH entries are deliberately
@@ -43,12 +52,13 @@ int fs_check_regular(const char *path);
  * descriptor. Returns -1 with errno set on failure or when the path is not a regular file. */
 int fs_open_regular(const char *path);
 
-/* Return newly allocated, NUL-terminated file contents, or NULL with errno set. */
+/* Read a regular file into an allocated, NUL-terminated buffer. On success, optional `out_len`
+ * receives the byte count excluding the terminator. Returns NULL with errno set on failure. */
 char *fs_read_file(const char *path, size_t *out_len);
 
-/* Read at most cap bytes. On success, optional outputs report the returned length and whether more
- * data exists. The allocation grows with the bytes read rather than cap. Returns NULL with errno
- * set on failure. */
+/* Read at most cap bytes from a regular file into an allocated, NUL-terminated buffer. On success,
+ * optional outputs report the returned length and whether more data exists. The allocation grows
+ * with the bytes read rather than cap. Returns NULL with errno set on failure. */
 char *fs_read_file_capped(const char *path, size_t cap, size_t *out_len, int *out_truncated);
 
 #endif /* HAX_SYSTEM_FS_H */

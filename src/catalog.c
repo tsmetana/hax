@@ -2,14 +2,11 @@
 #include "catalog.h"
 
 #include <jansson.h>
-#include <libgen.h>
 #include <stdatomic.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <time.h>
-#include <unistd.h>
 #include <sys/stat.h>
 
 #include "config.h"
@@ -17,7 +14,6 @@
 #include "xalloc.h"
 #include "system/bg_job.h"
 #include "system/clock.h"
-#include "system/fd.h"
 #include "system/fs.h"
 #include "system/path.h"
 #include "transport/http.h"
@@ -809,30 +805,6 @@ static void fetch_args_free(struct fetch_args *args)
     free(args);
 }
 
-/* Rename a sibling temporary file so concurrent readers never observe a partial snapshot. */
-static int write_cache_atomic(const char *path, const char *body, size_t body_length)
-{
-    char *path_copy = xstrdup(path);
-    fs_mkdir_p(dirname(path_copy));
-    free(path_copy);
-
-    char *temp_path = xasprintf("%s.tmp.XXXXXX", path);
-    int fd = mkstemp(temp_path);
-    if (fd < 0) {
-        free(temp_path);
-        return -1;
-    }
-    int result = fd_write_all(fd, body, body_length);
-    if (close(fd) != 0)
-        result = -1;
-    if (result == 0 && rename(temp_path, path) != 0)
-        result = -1;
-    if (result != 0)
-        unlink(temp_path);
-    free(temp_path);
-    return result;
-}
-
 static void fetch_worker(struct bg_job *job, void *arg)
 {
     struct fetch_args *args = arg;
@@ -841,7 +813,8 @@ static void fetch_worker(struct bg_job *job, void *arg)
         if (http_get(args->url, NULL, CATALOG_FETCH_TIMEOUT_S, CATALOG_MAX_BYTES,
                      bg_job_cancel_tick, job, &body, NULL) == 0 &&
             body) {
-            if (catalog_text_valid(body) && write_cache_atomic(args->path, body, strlen(body)) == 0)
+            /* The cache is expendable, so the write skips durability fsyncs. */
+            if (catalog_text_valid(body) && fs_write_atomic(args->path, body, strlen(body), 0) == 0)
                 atomic_fetch_add(&g_cache_generation, 1);
         }
         free(body);

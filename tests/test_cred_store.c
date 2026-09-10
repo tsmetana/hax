@@ -1,11 +1,16 @@
 /* SPDX-License-Identifier: MIT */
+#include <errno.h>
 #include <jansson.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 #include "cred_store.h"
 #include "harness.h"
+#include "xalloc.h"
+#include "system/fs.h"
 
 /* Point the store at a scratch state directory the test controls. */
 static void scratch_state_home(void)
@@ -221,8 +226,65 @@ static void test_take_returns_removed_entry(void)
     EXPECT(cred_store_get("codex") == NULL);
 }
 
+static void test_symlink_aliases_share_transaction_lock(void)
+{
+    scratch_state_home();
+    json_t *entry = json_pack("{s:i}", "count", 0);
+    EXPECT(cred_store_set("codex", entry) == 0);
+    json_decref(entry);
+    char *destination = cred_store_file_path();
+    const char *homes[] = {t_tempdir(), t_tempdir()};
+    pid_t children[2] = {-1, -1};
+    enum { UPDATES = 64 };
+
+    for (size_t i = 0; i < 2; i++) {
+        char *directory = xasprintf("%s/hax", homes[i]);
+        EXPECT(fs_mkdir_p(directory) == 0);
+        char *alias = xasprintf("%s/auth.json", directory);
+        EXPECT(symlink(destination, alias) == 0);
+        free(alias);
+        free(directory);
+
+        children[i] = fork();
+        EXPECT(children[i] >= 0);
+        if (children[i] == 0) {
+            if (setenv("XDG_STATE_HOME", homes[i], 1) != 0)
+                _exit(1);
+            for (int update = 0; update < UPDATES; update++) {
+                if (cred_store_update("codex", bump_counter, NULL) != 1)
+                    _exit(1);
+            }
+            _exit(0);
+        }
+    }
+    for (size_t i = 0; i < 2; i++) {
+        if (children[i] < 0)
+            continue;
+        int status = 0;
+        pid_t waited;
+        do {
+            waited = waitpid(children[i], &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        EXPECT(waited == children[i] && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+        char *alias_lock = xasprintf("%s/hax/auth.json.lock", homes[i]);
+        struct stat st;
+        EXPECT(lstat(alias_lock, &st) == -1 && errno == ENOENT);
+        free(alias_lock);
+        char *alias = xasprintf("%s/hax/auth.json", homes[i]);
+        EXPECT(lstat(alias, &st) == 0 && S_ISLNK(st.st_mode));
+        free(alias);
+    }
+    json_t *loaded = cred_store_get("codex");
+    EXPECT(loaded != NULL);
+    EXPECT(json_integer_value(json_object_get(loaded, "count")) == 2 * UPDATES);
+    json_decref(loaded);
+    free(destination);
+}
+
 int main(void)
 {
+    test_symlink_aliases_share_transaction_lock();
     test_missing_store();
     test_set_get_delete_roundtrip();
     test_store_mode_0600();
