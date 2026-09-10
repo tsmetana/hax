@@ -38,7 +38,7 @@ char *placeholder_expand(const char *text, const char *name, const char *value)
         out += value_len;
         rest = at + token_len;
     }
-    strcpy(out, rest);
+    memcpy(out, rest, strlen(rest) + 1);
     free(token);
     return result;
 }
