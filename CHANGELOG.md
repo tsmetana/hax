@@ -7,6 +7,13 @@ notes (see [docs/releasing.md](docs/releasing.md)).
 
 ## [Unreleased]
 
+### Changed
+
+- The collapsed preview for read-only bash commands now tolerates `echo`, `printf`, `true`, and
+  `false` between exploration commands, such as the `echo ---` separators some models place
+  between searches, and covers read-only git subcommands like `log`, `show`, `diff`, `status`,
+  and `blame`, including behind global options such as `-C`.
+
 ### Fixed
 
 - `config.json` and `state.json` are now written with a trailing newline, matching `auth.json`

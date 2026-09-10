@@ -7,11 +7,13 @@
 
 #include "buf.h"
 
-/* Formatting filters require an upstream producer; unknown commands, shell side effects, and
- * recognized writer options reject the exploration classification. */
+/* Formatting filters require an upstream producer; inert commands only print their arguments and
+ * never decide the verdict; unknown commands, shell side effects, and recognized writer options
+ * reject the exploration classification. */
 enum command_class {
     COMMAND_EXPLORATION,
     COMMAND_FILTER,
+    COMMAND_INERT,
     COMMAND_UNKNOWN,
 };
 
@@ -36,9 +38,9 @@ static int is_list_command(const char *command)
 {
     /* `env` is a neutral prefix; `wc` is a filter unless it has a file operand. */
     static const char *const names[] = {
-        "ls",  "eza",      "exa",      "tree",     "find",    "fd",       "stat",    "file",
-        "pwd", "realpath", "readlink", "which",    "whereis", "basename", "dirname", "du",
-        "df",  "id",       "whoami",   "hostname", "uname",   "true",     "false",
+        "ls",      "eza", "exa",      "tree",     "find",   "fd",       "stat",
+        "file",    "pwd", "realpath", "readlink", "which",  "whereis",  "basename",
+        "dirname", "du",  "df",       "id",       "whoami", "hostname", "uname",
     };
     return NAME_IN_LIST(names, command);
 }
@@ -49,13 +51,21 @@ static int is_search_command(const char *command)
     return NAME_IN_LIST(names, command);
 }
 
+/* Redirections and substitutions are rejected lexically before any segment is classified, so an
+ * inert command that reaches this point can only print. */
+static int is_inert_command(const char *command)
+{
+    static const char *const names[] = {"echo", "printf", "true", "false", ":"};
+    return NAME_IN_LIST(names, command);
+}
+
 /* These commands are filters without a file operand and readers with one. Writers and unbounded
  * producers are intentionally absent. */
 static int is_format_filter(const char *command)
 {
     static const char *const names[] = {
-        "wc",  "sort", "uniq",   "cut",      "tr",    "awk",  "sed",  "head", "tail",   "tac",
-        "rev", "fold", "expand", "unexpand", "paste", "comm", "join", "echo", "printf", "column",
+        "wc",  "sort", "uniq", "cut",    "tr",       "awk",   "sed",  "head", "tail",
+        "tac", "rev",  "fold", "expand", "unexpand", "paste", "comm", "join", "column",
     };
     return NAME_IN_LIST(names, command);
 }
@@ -63,7 +73,7 @@ static int is_format_filter(const char *command)
 /* Non-flag operands to these filters are content, not file paths. */
 static int is_content_filter(const char *command)
 {
-    static const char *const names[] = {"echo", "printf", "tr"};
+    static const char *const names[] = {"tr"};
     return NAME_IN_LIST(names, command);
 }
 
@@ -118,13 +128,9 @@ static const struct command_spec *command_spec_for(const char *name)
     return NULL;
 }
 
-/* Only explicitly read-only git subcommands qualify for a collapsed preview. */
-static enum command_class classify_command(const char *leader, const char *subcommand)
+static enum command_class classify_command(const char *leader)
 {
     if (is_read_command(leader) || is_search_command(leader) || is_list_command(leader))
-        return COMMAND_EXPLORATION;
-    if (strcmp(leader, "git") == 0 && subcommand &&
-        (strcmp(subcommand, "grep") == 0 || strcmp(subcommand, "ls-files") == 0))
         return COMMAND_EXPLORATION;
     return COMMAND_UNKNOWN;
 }
@@ -391,7 +397,7 @@ static enum command_class classify_xargs(const char *body, const char *segment_e
             return COMMAND_UNKNOWN;
         int is_flag = token[0] == '-' && token[1] != '\0';
         if (!is_flag) {
-            enum command_class classification = classify_command(token, NULL);
+            enum command_class classification = classify_command(token);
             free(token);
             return classification;
         }
@@ -563,6 +569,52 @@ static int sed_edits_in_place(const char *body, const char *segment_end)
     return 0;
 }
 
+/* Subcommands with mutating modes of their own, such as `reflog expire`, are left out. */
+static int is_read_only_git_subcommand(const char *subcommand)
+{
+    static const char *const names[] = {
+        "grep",     "ls-files", "ls-tree",  "log",       "show",
+        "diff",     "status",   "blame",    "rev-parse", "describe",
+        "shortlog", "cat-file", "rev-list", "show-ref",  "for-each-ref",
+    };
+    return NAME_IN_LIST(names, subcommand);
+}
+
+/* The diff family accepts `--output=<file>`; `-o` is not a git option, so rejecting it is
+ * harmless. */
+static int git_subcommand_writes(const char *subcommand, const char *arguments,
+                                 const char *segment_end)
+{
+    static const char *const diff_family[] = {"log", "show", "diff"};
+    return NAME_IN_LIST(diff_family, subcommand) && has_output_option(arguments, segment_end);
+}
+
+/* Global options precede the subcommand; the listed ones consume a separate value token. */
+static enum command_class classify_git(const char *body, const char *segment_end)
+{
+    static const char *const value_options[] = {"-C", "-c", "--git-dir", "--work-tree",
+                                                "--namespace"};
+    const char *cursor = skip_command_word(body, segment_end);
+    while (cursor < segment_end) {
+        char *token = take_word(cursor, segment_end, &cursor);
+        if (!token)
+            return COMMAND_UNKNOWN;
+        if (token[0] != '-') {
+            int reads = is_read_only_git_subcommand(token) &&
+                        !git_subcommand_writes(token, cursor, segment_end);
+            free(token);
+            return reads ? COMMAND_EXPLORATION : COMMAND_UNKNOWN;
+        }
+        int takes_value = NAME_IN_LIST(value_options, token);
+        free(token);
+        if (takes_value) {
+            char *value = take_word(cursor, segment_end, &cursor);
+            free(value);
+        }
+    }
+    return COMMAND_UNKNOWN;
+}
+
 static int known_command_writes(const char *command, const char *body, const char *segment_end)
 {
     if ((strcmp(command, "find") == 0 || strcmp(command, "fd") == 0) &&
@@ -603,10 +655,13 @@ static enum command_class classify_segment(const char *segment, const char *segm
     char *command = take_word(cursor, segment_end, &cursor);
     if (!command)
         return COMMAND_UNKNOWN;
-    char *subcommand = take_word(cursor, segment_end, &cursor);
 
-    enum command_class classification = classify_command(command, subcommand);
-    if (classification != COMMAND_UNKNOWN) {
+    enum command_class classification = classify_command(command);
+    if (is_inert_command(command)) {
+        classification = COMMAND_INERT;
+    } else if (strcmp(command, "git") == 0) {
+        classification = classify_git(body, segment_end);
+    } else if (classification != COMMAND_UNKNOWN) {
         if (known_command_writes(command, body, segment_end)) {
             classification = COMMAND_UNKNOWN;
         } else {
@@ -623,7 +678,6 @@ static enum command_class classify_segment(const char *segment, const char *segm
     }
 
     free(command);
-    free(subcommand);
     return classification;
 }
 
@@ -712,11 +766,13 @@ static int classify_segment_callback(const char *segment, const char *segment_en
     if (classification == COMMAND_UNKNOWN)
         return 0;
     if (classification == COMMAND_FILTER) {
-        /* A standalone filter may block on stdin or emit unrelated content. */
+        /* A standalone filter may block on stdin. */
         return state->statement_has_producer;
     }
+    /* An inert head keeps downstream filters from blocking but reads nothing itself. */
     state->statement_has_producer = 1;
-    state->has_substantive_command = 1;
+    if (classification == COMMAND_EXPLORATION)
+        state->has_substantive_command = 1;
     return 1;
 }
 

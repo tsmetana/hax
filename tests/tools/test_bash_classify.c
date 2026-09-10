@@ -32,7 +32,19 @@ int main(void)
     expect_exploration("stat foo.c");
     expect_exploration("which gcc");
     expect_exploration("git ls-files");
+    expect_exploration("git ls-files -o"); /* --others, not an output file */
     expect_exploration("git grep TODO");
+    expect_exploration("git status");
+    expect_exploration("git log -1 --stat");
+    expect_exploration("git show HEAD");
+    expect_exploration("git diff --stat HEAD~1");
+    expect_exploration("git blame src/main.c");
+    expect_exploration("git rev-parse HEAD");
+    expect_exploration("git log -1 --stat && git show --stat HEAD | head -50");
+    /* Global options before the subcommand, with and without separate values. */
+    expect_exploration("git -C ~/source/hax log -1");
+    expect_exploration("git -c core.pager=cat --no-pager show HEAD");
+    expect_exploration("git --git-dir=.git status");
     expect_exploration("head foo.c");
     expect_exploration("tail -n 50 log.txt");
     expect_exploration("wc -l foo.c"); /* file operand → read-like */
@@ -64,8 +76,16 @@ int main(void)
     expect_exploration("grep -r foo src 2>&1 | head");
 
     /* Action commands fall through. */
-    expect_not_exploration("git status");
-    expect_not_exploration("git log");
+    expect_not_exploration("git commit -m x");
+    expect_not_exploration("git checkout devel");
+    expect_not_exploration("git push");
+    expect_not_exploration("git reflog expire --all");
+    expect_not_exploration("git -C ~/source/hax"); /* no subcommand */
+    expect_not_exploration("git -C");              /* value missing */
+    /* The diff family can write its output to a file. */
+    expect_not_exploration("git log --output=log.txt");
+    expect_not_exploration("git diff --output patch.diff");
+    expect_not_exploration("git show -o out HEAD");
     expect_not_exploration("rm foo");
     expect_not_exploration("cargo build");
     expect_not_exploration("cargo test");
@@ -261,11 +281,8 @@ int main(void)
     expect_exploration("sed -n '1,20p' foo.c");
 
     /* Format-only commands need at least one real source segment.
-     * Standalone filters (echo with no args, wc -l, head -20, sort -n,
-     * rev, etc.) block on stdin or emit unrelated content; the user
-     * should see them in full instead of a silent header. */
-    expect_not_exploration("echo");
-    expect_not_exploration("printf 'hi\\n'");
+     * Standalone filters (wc -l, head -20, sort -n, rev, etc.) block on
+     * stdin; the user should see them in full instead of a silent header. */
     expect_not_exploration("wc -l");
     expect_not_exploration("head -20");
     expect_not_exploration("sort -n");
@@ -327,10 +344,8 @@ int main(void)
 
     /* Filters require an upstream producer in the same pipeline; statement separators reset it. */
     expect_not_exploration("ls; sort");
-    expect_not_exploration("ls; echo hi");
     expect_not_exploration("ls; wc -l");
-    expect_not_exploration("ls && cat"); /* cat alone after && would hang */
-    expect_not_exploration("grep x file || printf 'no match\\n'");
+    expect_not_exploration("ls && cat");            /* cat alone after && would hang */
     expect_not_exploration("find . | sort; wc -l"); /* pipeline OK, then ;wc rejects */
     expect_not_exploration("ls\nwc -l");            /* newline is statement-level */
     /* Empty segment between connectors must not "eat" the surrounding
@@ -344,6 +359,26 @@ int main(void)
      * propagate the producer state from segment to segment. */
     expect_exploration("cat foo.c | wc -l | head");
     expect_exploration("find . | sort | uniq | head");
+
+    /* Inert printers never decide the verdict: alone they read nothing, and
+     * between exploration commands they are just separators or status notes. */
+    expect_not_exploration("echo");
+    expect_not_exploration("echo hi");
+    expect_not_exploration("printf 'hi\\n'");
+    expect_not_exploration("true");
+    expect_not_exploration("echo x | sort"); /* nothing read */
+    expect_exploration("ls; echo hi");
+    expect_exploration("ls; true");
+    expect_exploration("grep x file || printf 'no match\\n'");
+    expect_exploration("rg -n foo src | head; echo ---; fd -e c . src");
+    expect_exploration("sed -n 620,650p a.c; echo ---; sed -n 120,140p b.c");
+    expect_exploration("rg foo src; echo \"exit=$?\"");
+    expect_exploration("ls | echo"); /* echo ignores stdin */
+    /* Inert output still cannot feed a writer or precede an action. */
+    expect_not_exploration("echo hi | tee out.txt");
+    expect_not_exploration("echo x | xargs rm");
+    expect_not_exploration("echo hi > out.txt");
+    expect_not_exploration("echo hi; make");
 
     /* Newline is a top-level command separator — a multiline string
      * with a non-exploration command on a later line must reject. */
