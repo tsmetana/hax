@@ -1,10 +1,16 @@
 /* SPDX-License-Identifier: MIT */
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+/* struct timeval is not exposed by socket headers on every libc. */
+#include <sys/time.h> // IWYU pragma: keep
 
 #include "buf.h"
 #include "harness.h"
@@ -106,17 +112,38 @@ static int connect_loopback(int port)
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     EXPECT(fd >= 0);
+    if (fd < 0)
+        return -1;
+    struct timeval timeout = {.tv_sec = 5};
+    EXPECT(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
+    EXPECT(setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == 0);
+    int flags = fcntl(fd, F_GETFL, 0);
+    EXPECT(flags >= 0);
+    EXPECT(fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0);
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t)port);
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    EXPECT(connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    int result = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (result < 0 && errno == EINPROGRESS) {
+        struct pollfd pfd = {.fd = fd, .events = POLLOUT};
+        int error = 0;
+        socklen_t length = sizeof(error);
+        result = poll(&pfd, 1, 5000) > 0 &&
+                         getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) == 0 && error == 0
+                     ? 0
+                     : -1;
+    }
+    EXPECT(result == 0);
+    if (result != 0) {
+        close(fd);
+        return -1;
+    }
+    EXPECT(fcntl(fd, F_SETFL, flags) == 0);
     return fd;
 }
 
-/* Connect and queue a full request before the listener runs: the backlog holds it, so the
- * single-threaded wait below finds it on its first poll. */
 static int queue_request(int port, const char *target)
 {
     int fd = connect_loopback(port);
@@ -134,6 +161,7 @@ static char *read_response(int fd)
     ssize_t count;
     while ((count = read(fd, chunk, sizeof(chunk))) > 0)
         buf_append(&response, chunk, (size_t)count);
+    EXPECT(count == 0);
     char *text = buf_steal(&response);
     return text ? text : xstrdup("");
 }
@@ -166,6 +194,22 @@ static void test_listener_captures_code(void)
     oauth_listener_close(listener);
 }
 
+struct listener_wait {
+    struct oauth_listener *listener;
+    const char *state;
+    enum oauth_redirect_result result;
+    char *code;
+    char *detail;
+};
+
+static void *wait_for_redirect(void *user)
+{
+    struct listener_wait *wait = user;
+    wait->result = oauth_listener_wait(wait->listener, "/cb", wait->state, monotonic_ms() + 5000,
+                                       NULL, NULL, &wait->code, &wait->detail);
+    return NULL;
+}
+
 static void test_listener_survives_stray_requests(void)
 {
     int port = 0;
@@ -175,34 +219,46 @@ static void test_listener_survives_stray_requests(void)
     if (!listener)
         return;
 
-    /* Wrong path, wrong state, and a state-less probe of the right path must all be answered
-     * without ending the wait; only the matching redirect does. */
-    int stray_path = queue_request(port, "/favicon.ico");
-    int stray_state = queue_request(port, "/cb?code=evil&state=WRONG");
-    int stray_probe = queue_request(port, "/cb");
-    int genuine = queue_request(port, "/cb?state=S2&code=ok");
+    struct listener_wait wait = {.listener = listener, .state = "S2"};
+    pthread_t thread;
+    int result = pthread_create(&thread, NULL, wait_for_redirect, &wait);
+    EXPECT(result == 0);
+    if (result != 0) {
+        oauth_listener_close(listener);
+        return;
+    }
 
-    char *code = NULL;
-    char *detail = NULL;
-    EXPECT(oauth_listener_wait(listener, "/cb", "S2", monotonic_ms() + 5000, NULL, NULL, &code,
-                               &detail) == OAUTH_REDIRECT_CODE);
-    EXPECT_STR_EQ(code, "ok");
-    free(code);
-
-    char *response = read_response(stray_path);
+    /* Accept order is not guaranteed: finish each stray request before sending the redirect. */
+    int fd = queue_request(port, "/favicon.ico");
+    char *response = read_response(fd);
     EXPECT(strstr(response, "404 Not Found") != NULL);
     free(response);
-    response = read_response(stray_state);
+    close(fd);
+
+    fd = queue_request(port, "/cb?code=evil&state=WRONG");
+    response = read_response(fd);
     EXPECT(strstr(response, "400 Bad Request") != NULL);
     EXPECT(strstr(response, "Login mismatch") != NULL);
     free(response);
-    response = read_response(stray_probe);
+    close(fd);
+
+    fd = queue_request(port, "/cb");
+    response = read_response(fd);
     EXPECT(strstr(response, "400 Bad Request") != NULL);
     free(response);
-    close(stray_path);
-    close(stray_state);
-    close(stray_probe);
-    close(genuine);
+    close(fd);
+
+    fd = queue_request(port, "/cb?state=S2&code=ok");
+    response = read_response(fd);
+    EXPECT(strstr(response, "Login complete") != NULL);
+    free(response);
+    close(fd);
+    EXPECT(pthread_join(thread, NULL) == 0);
+    EXPECT(wait.result == OAUTH_REDIRECT_CODE);
+    EXPECT_STR_EQ(wait.code, "ok");
+    EXPECT(wait.detail == NULL);
+    free(wait.code);
+    free(wait.detail);
     oauth_listener_close(listener);
 }
 
@@ -242,26 +298,38 @@ static void test_listener_accepts_state_suffix(void)
     if (!listener)
         return;
 
-    int truncated = queue_request(port, "/cb?code=evil&state=S");
-    int extended = queue_request(port, "/cb?code=evil&state=S4x");
-    int suffixed = queue_request(port, "/cb?code=ok&state=S4.onboarding_entrypoint=life_sciences");
+    struct listener_wait wait = {.listener = listener, .state = "S4"};
+    pthread_t thread;
+    int result = pthread_create(&thread, NULL, wait_for_redirect, &wait);
+    EXPECT(result == 0);
+    if (result != 0) {
+        oauth_listener_close(listener);
+        return;
+    }
 
-    char *code = NULL;
-    char *detail = NULL;
-    EXPECT(oauth_listener_wait(listener, "/cb", "S4", monotonic_ms() + 5000, NULL, NULL, &code,
-                               &detail) == OAUTH_REDIRECT_CODE);
-    EXPECT_STR_EQ(code, "ok");
-    free(code);
-
-    char *response = read_response(truncated);
+    int fd = queue_request(port, "/cb?code=evil&state=S");
+    char *response = read_response(fd);
     EXPECT(strstr(response, "Login mismatch") != NULL);
     free(response);
-    response = read_response(extended);
+    close(fd);
+
+    fd = queue_request(port, "/cb?code=evil&state=S4x");
+    response = read_response(fd);
     EXPECT(strstr(response, "Login mismatch") != NULL);
     free(response);
-    close(truncated);
-    close(extended);
-    close(suffixed);
+    close(fd);
+
+    fd = queue_request(port, "/cb?code=ok&state=S4.onboarding_entrypoint=life_sciences");
+    response = read_response(fd);
+    EXPECT(strstr(response, "Login complete") != NULL);
+    free(response);
+    close(fd);
+    EXPECT(pthread_join(thread, NULL) == 0);
+    EXPECT(wait.result == OAUTH_REDIRECT_CODE);
+    EXPECT_STR_EQ(wait.code, "ok");
+    EXPECT(wait.detail == NULL);
+    free(wait.code);
+    free(wait.detail);
     oauth_listener_close(listener);
 }
 
